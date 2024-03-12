@@ -30,6 +30,20 @@ const query = gql`
   }
 `;
 
+interface UserReserve {
+  debt: number;
+  price: number;
+  token: string;
+  totalBal: string;
+  decimals: number;
+}
+
+interface LiquidablePosition extends Liq {
+  extra: {
+    url: string;
+  };
+}
+
 interface User {
   id: string;
   reserves: {
@@ -59,7 +73,6 @@ const ethPriceQuery = (usdcAddress: string) => gql`
 
 enum Chains {
   ethereum = "ethereum",
-  // polygon = "polygon",
 }
 
 type AaveAdapterResource = {
@@ -70,7 +83,7 @@ type AaveAdapterResource = {
   explorerBaseUrl: string;
 };
 
-const rc: { [chain in Chains]: AaveAdapterResource } = {
+const rc: Record<Chains, AaveAdapterResource> = {
   [Chains.ethereum]: {
     name: "aave",
     chain: Chains.ethereum,
@@ -78,90 +91,62 @@ const rc: { [chain in Chains]: AaveAdapterResource } = {
     subgraphUrl: "https://api.thegraph.com/subgraphs/name/aave/protocol-v2",
     explorerBaseUrl: "https://etherscan.io/address/",
   },
-  // [Chains.polygon]: {
-  //   name: "aave",
-  //   chain: Chains.polygon,
-  //   usdcAddress: "0x2791bca1f2de4661ed88a30c99a7a9449aa84174",
-  //   subgraphUrl: "https://api.thegraph.com/subgraphs/name/aave/aave-v2-matic",
-  //   explorerBaseUrl: "https://polygonscan.com/address/",
-  // },
 };
 
-const positions = (chain: Chains) => async () => {
+const calculatePositions = async (chain: Chains): Promise<Liq[]> => {
   const explorerBaseUrl = rc[chain].explorerBaseUrl;
   const subgraphUrl = rc[chain].subgraphUrl;
   const usdcAddress = rc[chain].usdcAddress;
-  const _ethPriceQuery = ethPriceQuery(usdcAddress);
+  const ethPriceQueryResult = await request(subgraphUrl, ethPriceQuery(usdcAddress));
+  const ethPrice = 1 / (ethPriceQueryResult.priceOracleAsset.priceInEth / 1e18);
   const users = (await getPagedGql(rc[chain].subgraphUrl, query, "users")) as User[];
-  const ethPrice = 1 / ((await request(subgraphUrl, _ethPriceQuery)).priceOracleAsset.priceInEth / 1e18);
-  const positions = users
-    .map((user) => {
-      let totalDebt = 0,
-        totalCollateral = 0;
-      const debts = (user.reserves as any[]).map((reserve) => {
-        const decimals = 10 ** reserve.reserve.decimals;
-        const price = (Number(reserve.reserve.price.priceInEth) / 1e18) * ethPrice;
-        const liqThreshold = Number(reserve.reserve.reserveLiquidationThreshold) / 1e4; // belongs to [0, 1]
-        let debt = Number(reserve.currentTotalDebt);
-        if (reserve.usageAsCollateralEnabledOnUser === true) {
-          debt -= Number(reserve.currentATokenBalance) * liqThreshold;
-        }
-        debt *= price / decimals;
-        if (debt > 0) {
-          totalDebt += debt;
-        } else {
-          totalCollateral -= debt;
-        }
-        return {
-          debt,
-          price,
-          token: reserve.reserve.underlyingAsset,
-          totalBal: reserve.currentATokenBalance,
-          decimals,
-        };
-      });
 
-      const liquidablePositions: Liq[] = debts
-        .filter(({ debt }) => debt < 0)
-        .map((pos) => {
-          const usdPosNetCollateral = -pos.debt;
-          const otherCollateral = totalCollateral - usdPosNetCollateral;
-          const diffDebt = totalDebt - otherCollateral;
-          if (diffDebt > 0) {
-            const amountCollateral = usdPosNetCollateral / pos.price; // accounts for liqThreshold
-            const liqPrice = diffDebt / amountCollateral;
-            // if liqPrice > pos.price -> bad debt
-            return {
-              owner: user.id as string,
-              liqPrice,
-              collateral: `${chain}:` + pos.token,
-              collateralAmount: pos.totalBal as string,
-              extra: {
-                url: explorerBaseUrl + user.id,
-              },
-            } as Liq;
-          } else {
-            return {
-              owner: "",
-              liqPrice: 0,
-              collateral: "",
-              collateralAmount: "",
-            };
-          }
-        })
-        .filter((t) => !!t.owner);
+  const positions = users.flatMap((user) => {
+    let totalDebt = 0;
+    let totalCollateral = 0;
 
-      return liquidablePositions;
-    })
-    .flat();
-  return positions;
-};
+    const debts: UserReserve[] = user.reserves.map((reserve) => {
+      const decimals = 10 ** reserve.reserve.decimals;
+      const price = (Number(reserve.reserve.price.priceInEth) / 1e18) * ethPrice;
+      const liqThreshold = Number(reserve.reserve.reserveLiquidationThreshold) / 1e4;
+      let debt = Number(reserve.currentTotalDebt);
 
-module.exports = {
-  ethereum: {
-    liquidations: positions(Chains.ethereum),
-  },
-  // polygon: {
-  //   liquidations: positions(Chains.polygon),
-  // },
-};
+      if (reserve.usageAsCollateralEnabledOnUser === true) {
+        debt -= Number(reserve.currentATokenBalance) * liqThreshold;
+      }
+
+      debt *= price / decimals;
+
+      if (debt > 0) {
+        totalDebt += debt;
+      } else {
+        totalCollateral -= debt;
+      }
+
+      return {
+        debt,
+        price,
+        token: reserve.reserve.underlyingAsset,
+        totalBal: reserve.currentATokenBalance,
+        decimals,
+      };
+    });
+
+    const liquidablePositions: LiquidablePosition[] = debts
+      .filter(({ debt }) => debt < 0)
+      .map((pos) => {
+        const usdPosNetCollateral = -pos.debt;
+        const otherCollateral = totalCollateral - usdPosNetCollateral;
+        const diffDebt = totalDebt - otherCollateral;
+
+        if (diffDebt > 0) {
+          const amountCollateral = usdPosNetCollateral / pos.price;
+          const liqPrice = diffDebt / amountCollateral;
+
+          return {
+            owner: user.id as string,
+            liqPrice,
+            collateral: `${chain}:` + pos.token,
+            collateralAmount: pos.totalBal as string,
+            extra: {
+              u
